@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Streaming Agent Gateway</title>
+  <style>
+    :root { color-scheme: light; --ink: #17324d; --paper: #f4f0e8; --accent: #df5b3f; --line: #c9c2b6; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px Georgia, serif; }
+    main { width: min(1180px, calc(100% - 32px)); margin: 32px auto; }
+    h1 { font-size: clamp(2rem, 6vw, 4.5rem); line-height: .95; margin: 0 0 28px; max-width: 660px; }
+    .app-shell { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 28px; align-items: start; }
+    .history { border-right: 1px solid var(--line); padding-right: 20px; min-width: 0; }
+    .history h2 { margin: 0 0 14px; font-size: 1rem; font-weight: normal; }
+    #history-list { display: grid; gap: 6px; }
+    .history-item { width: 100%; display: grid; gap: 5px; padding: 10px; border: 1px solid transparent; background: transparent; color: var(--ink); text-align: left; font: inherit; }
+    .history-item:hover, .history-item.selected { border-color: var(--line); background: #fffdf8; }
+    .history-prompt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .history-meta { display: flex; justify-content: space-between; gap: 8px; font-size: .75rem; opacity: .72; }
+    .history-state[data-state="active"] { color: #176b50; }
+    .history-state[data-state="failed"] { color: #b3261e; }
+    .workspace { min-width: 0; }
+    .controls { display: grid; gap: 12px; grid-template-columns: 1fr auto; }
+    textarea { min-height: 90px; resize: vertical; border: 1px solid var(--line); padding: 12px; background: #fffdf8; font: inherit; }
+    button { border: 0; padding: 0 18px; background: var(--accent); color: white; font: inherit; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: wait; }
+    .actions { display: flex; gap: 10px; margin-top: 12px; }
+    .actions button:last-child { background: var(--ink); }
+    #status { margin: 28px 0 10px; color: var(--accent); }
+    #output { min-height: 160px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.55; border-top: 1px solid var(--line); padding-top: 18px; }
+    #run-id { font-size: .8rem; opacity: .7; word-break: break-all; }
+    @media (max-width: 720px) { .app-shell { grid-template-columns: 1fr; } .history { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 16px; } #history-list { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); } .controls { grid-template-columns: 1fr; } button { min-height: 44px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Streaming Agent Gateway</h1>
+    <div class="app-shell">
+      <aside class="history">
+        <h2>历史记录</h2>
+        <div id="history-list"></div>
+      </aside>
+      <section class="workspace">
+        <div class="controls">
+          <textarea id="prompt" placeholder="输入 prompt..."></textarea>
+          <button id="send">运行</button>
+        </div>
+        <div class="actions">
+          <button id="cancel" disabled>取消运行</button>
+          <button id="unsubscribe" disabled>取消订阅</button>
+          <button id="reconnect" disabled>从游标重连</button>
+        </div>
+        <div id="status">空闲</div>
+        <div id="run-id"></div>
+        <div id="output"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    let runId = null;
+    let lastSequence = 0;
+    let source = null;
+    const currentRunKey = "streaming-agent-gateway.current-run";
+    const $ = (id) => document.getElementById(id);
+    function setStatus(text) { $("status").textContent = text; }
+    function stateLabel(terminalState) {
+      return { completed: "已完成", cancelled: "已取消", failed: "失败" }[terminalState] || "运行中";
+    }
+    async function loadHistory() {
+      const response = await fetch("/runs");
+      if (!response.ok) return;
+      const { runs } = await response.json();
+      const list = $("history-list");
+      list.replaceChildren();
+      runs.forEach((run) => {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = `history-item${run.run_id === runId ? " selected" : ""}`;
+        const prompt = document.createElement("span");
+        prompt.className = "history-prompt";
+        prompt.textContent = run.prompt || "(空 prompt)";
+        const meta = document.createElement("span");
+        meta.className = "history-meta";
+        const time = document.createElement("span");
+        time.textContent = new Date(run.started_at).toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+        const state = document.createElement("span");
+        state.className = "history-state";
+        state.dataset.state = run.terminal_state || "active";
+        state.textContent = stateLabel(run.terminal_state);
+        meta.append(time, state);
+        item.append(prompt, meta);
+        item.onclick = () => openRun(run.run_id);
+        list.append(item);
+      });
+    }
+    function rememberRun() {
+      if (runId) localStorage.setItem(currentRunKey, runId);
+      else localStorage.removeItem(currentRunKey);
+    }
+    function forgetRun() {
+      localStorage.removeItem(currentRunKey);
+    }
+    function applySnapshot(snapshot) {
+      const events = snapshot.events || [];
+      const started = events.find((event) => event.type === "run.started");
+      lastSequence = events.reduce((latest, event) => Math.max(latest, event.sequence), 0);
+      $("prompt").value = started?.payload?.prompt || "";
+      $("output").textContent = events
+        .filter((event) => event.type === "run.delta")
+        .map((event) => event.payload.text || "")
+        .join("");
+      $("run-id").textContent = runId;
+      if (snapshot.terminal_state) {
+        forgetRun();
+        setStatus(`终止: ${snapshot.terminal_state}`);
+        $("cancel").disabled = true;
+        $("unsubscribe").disabled = true;
+        $("reconnect").disabled = true;
+      } else {
+        rememberRun();
+        setStatus("运行中");
+        $("cancel").disabled = false;
+        connect(lastSequence);
+      }
+    }
+    async function openRun(selectedRunId) {
+      if (source) {
+        const previousSource = source;
+        source = null;
+        previousSource.close();
+      }
+      runId = selectedRunId;
+      const response = await fetch(`/runs/${runId}`);
+      if (!response.ok) {
+        setStatus("加载运行失败");
+        return;
+      }
+      applySnapshot(await response.json());
+      loadHistory();
+    }
+    async function restoreRun() {
+      runId = localStorage.getItem(currentRunKey);
+      if (!runId) return;
+      const response = await fetch(`/runs/${runId}`);
+      if (response.status === 404) {
+        runId = null;
+        forgetRun();
+        return;
+      }
+      if (!response.ok) {
+        setStatus("恢复运行失败");
+        return;
+      }
+      const snapshot = await response.json();
+      if (snapshot.terminal_state) {
+        runId = null;
+        lastSequence = 0;
+        forgetRun();
+        return;
+      }
+      applySnapshot(snapshot);
+    }
+    function connect(cursor = 0) {
+      if (source) source.close();
+      let terminalReceived = false;
+      source = new EventSource(`/runs/${runId}/events?after_sequence=${cursor}`);
+      const connectedSource = source;
+      $("unsubscribe").disabled = false;
+      $("reconnect").disabled = true;
+      const handleEvent = (event) => {
+        const data = JSON.parse(event.data);
+        lastSequence = data.sequence;
+        if (data.type === "run.delta") $("output").textContent += data.payload.text || "";
+        if (data.terminal_state) {
+          terminalReceived = true;
+          forgetRun();
+          setStatus(`终止: ${data.terminal_state}`);
+          connectedSource.close();
+          if (source === connectedSource) source = null;
+          $("cancel").disabled = true;
+          $("unsubscribe").disabled = true;
+          $("reconnect").disabled = true;
+          loadHistory();
+        }
+      };
+      ["run.started", "run.delta", "run.checkpoint", "run.retry", "run.completed", "run.cancelled", "run.failed"]
+        .forEach((eventType) => connectedSource.addEventListener(eventType, handleEvent));
+      connectedSource.onerror = () => {
+        if (source !== connectedSource) return;
+        if (!terminalReceived) setStatus("连接中断，可从游标重连");
+        connectedSource.close();
+        source = null;
+        $("unsubscribe").disabled = true;
+        $("reconnect").disabled = terminalReceived;
+      };
+    }
+    function unsubscribe() {
+      if (!source) return;
+      const subscribedSource = source;
+      source = null;
+      subscribedSource.close();
+      $("unsubscribe").disabled = true;
+      $("reconnect").disabled = false;
+      setStatus(`已取消订阅，停在序号 ${lastSequence}`);
+    }
+    $("send").onclick = async () => {
+      const response = await fetch("/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: $("prompt").value }) });
+      if (!response.ok) { setStatus("提交失败"); return; }
+      const data = await response.json(); runId = data.run_id; lastSequence = 0;
+      rememberRun(); $("run-id").textContent = runId; $("output").textContent = ""; $("cancel").disabled = false; setStatus("运行中"); connect(); loadHistory();
+    };
+    $("cancel").onclick = async () => { await fetch(`/runs/${runId}/cancel`, { method: "POST" }); setStatus("已请求取消"); };
+    $("unsubscribe").onclick = unsubscribe;
+    $("reconnect").onclick = () => { if (runId) { setStatus(`从序号 ${lastSequence} 重连`); connect(lastSequence); } };
+    restoreRun();
+    loadHistory();
+    setInterval(loadHistory, 2000);
+  </script>
+</body>
+</html>
